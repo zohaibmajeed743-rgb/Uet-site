@@ -1,0 +1,5 @@
+{
+  "rewrites": [
+    { "source": "/api/:a(login|data|save|upload)", "destination": "/api/site?a=:a" }
+  ]
+}
