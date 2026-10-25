@@ -1,9 +1,9 @@
 import crypto from 'node:crypto';
-import { put, list } from '@vercel/blob';
-
-export const config = { api: { bodyParser: false } };
+import { put, list, del } from '@vercel/blob';
 
 const TTL = 12 * 60 * 60 * 1000;
+export const config = { api: { bodyParser: false } };
+
 const TYPES = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif' };
 const MAX = 4 * 1024 * 1024;
 const secret = () => process.env.SESSION_SECRET || process.env.ADMIN_PASSWORD || '';
@@ -22,11 +22,22 @@ function authed(req) {
 
 function readBody(req) {
   return new Promise((resolve, reject) => {
+    if (req.readableEnded) return resolve(Buffer.alloc(0));
     const chunks = []; let size = 0;
-    req.on('data', (c) => { size += c.length; if (size > MAX) { reject(new Error('too_big')); req.destroy(); return; } chunks.push(c); });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', reject);
+    const timer = setTimeout(() => reject(new Error('Request body timed out')), 8000);
+    req.on('data', (c) => { size += c.length; if (size > MAX) { clearTimeout(timer); reject(new Error('too_big')); req.destroy(); return; } chunks.push(c); });
+    req.on('end', () => { clearTimeout(timer); resolve(Buffer.concat(chunks)); });
+    req.on('error', (e) => { clearTimeout(timer); reject(e); });
   });
+}
+
+async function readJson(req) {
+  let b;
+  try { b = req.body; } catch (e) { b = undefined; }
+  if (Buffer.isBuffer(b)) b = b.toString('utf8');
+  if (typeof b === 'string') { try { return JSON.parse(b); } catch (e) { return {}; } }
+  if (b && typeof b === 'object') return b;
+  try { return JSON.parse((await readBody(req)).toString('utf8')); } catch (e) { return {}; }
 }
 
 function clean(b) {
@@ -44,8 +55,46 @@ function clean(b) {
   });
   const c = b.contact || {};
   out.contact = { phone: str(c.phone, 30), email: str(c.email, 120) };
+  if (Array.isArray(b.rolls)) {
+    out.v = 2;
+    out.rolls = [];
+    b.rolls.slice(0, 300).forEach((r) => {
+      if (!r) return;
+      const name = str(r.name, 60), roll = str(r.roll, 40);
+      if (name || roll) out.rolls.push({ name, roll });
+    });
+    const p = b.party || {};
+    out.party = { open: p.open !== false, details: str(p.details, 600) };
+  }
   return out;
 }
+
+function storeHost() {
+  const t = process.env.BLOB_READ_WRITE_TOKEN || '';
+  const id = t.split('_')[3];
+  return id ? id.toLowerCase() + '.public.blob.vercel-storage.com' : '';
+}
+let memo = { at: 0, data: null };
+async function readData() {
+  if (memo.data && Date.now() - memo.at < 10000) return memo.data;
+  let data = null;
+  const host = storeHost();
+  if (host) {
+    try {
+      const r = await fetch('https://' + host + '/site/data.json?t=' + Date.now(), { cache: 'no-store' });
+      if (r.status === 404) data = {};
+      else if (r.ok) data = await r.json();
+    } catch (e) { data = null; }
+  }
+  if (data === null) {
+    const { blobs } = await list({ prefix: 'site/data.json', limit: 1 });
+    if (!blobs.length) data = {};
+    else { const r = await fetch(blobs[0].url + '?t=' + Date.now(), { cache: 'no-store' }); data = r.ok ? await r.json() : {}; }
+  }
+  memo = { at: Date.now(), data };
+  return data;
+}
+const slug = (n) => String(n).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60);
 
 export default async function handler(req, res) {
   res.setHeader('Cache-Control', 'no-store');
@@ -56,10 +105,8 @@ export default async function handler(req, res) {
   try {
     if (action === 'data') {
       try {
-        const { blobs } = await list({ prefix: 'site/data.json', limit: 1 });
-        if (!blobs.length) return res.status(200).json({});
-        const r = await fetch(blobs[0].url + '?t=' + Date.now(), { cache: 'no-store' });
-        return res.status(200).json(r.ok ? await r.json() : {});
+        res.setHeader('Cache-Control', 'public, s-maxage=20, stale-while-revalidate=60');
+        return res.status(200).json(await readData());
       } catch (e) { console.error('data error', e); return res.status(200).json({}); }
     }
 
@@ -67,8 +114,7 @@ export default async function handler(req, res) {
 
     if (action === 'login') {
       if (!process.env.ADMIN_PASSWORD) return res.status(500).json({ error: 'ADMIN_PASSWORD is not set in Vercel.' });
-      let body = {};
-      try { body = JSON.parse((await readBody(req)).toString('utf8')); } catch (e) {}
+      const body = await readJson(req);
       if (!crypto.timingSafeEqual(sha(body.password || ''), sha(process.env.ADMIN_PASSWORD))) {
         await new Promise((r) => setTimeout(r, 800));
         return res.status(401).json({ error: 'Wrong password.' });
@@ -76,16 +122,54 @@ export default async function handler(req, res) {
       return res.status(200).json({ token: sign() });
     }
 
+    if (action === 'rsvp') {
+      const b = await readJson(req);
+      if (b.hp) return res.status(200).json({ ok: true });
+      const name = str(b.name, 60).replace(/\s+/g, ' '), roll = str(b.roll, 30);
+      if (name.length < 2) return res.status(400).json({ error: 'Please enter your name.' });
+      const id = slug(name);
+      if (!id) return res.status(400).json({ error: 'Please enter a valid name.' });
+      const d = await readData();
+      if (d && d.party && d.party.open === false) return res.status(403).json({ error: 'Sign-ups are closed.' });
+      const { blobs } = await list({ prefix: 'site/rsvp/', limit: 1000 });
+      const exists = blobs.some((x) => x.pathname === 'site/rsvp/' + id + '.json');
+      if (!exists && blobs.length >= 300) return res.status(429).json({ error: 'The list is full.' });
+      await put('site/rsvp/' + id + '.json', JSON.stringify({ name, roll, at: new Date().toISOString() }), {
+        access: 'public', contentType: 'application/json', addRandomSuffix: false, allowOverwrite: true, cacheControlMaxAge: 60
+      });
+      return res.status(200).json({ ok: true });
+    }
+
     if (!authed(req)) return res.status(401).json({ error: 'Not logged in.' });
 
+    if (action === 'rsvps') {
+      const { blobs } = await list({ prefix: 'site/rsvp/', limit: 1000 });
+      const items = (await Promise.all(blobs.map(async (x) => {
+        try {
+          const r = await fetch(x.url + '?t=' + Date.now(), { cache: 'no-store' });
+          const j = await r.json();
+          return { id: x.pathname.slice('site/rsvp/'.length, -5), name: j.name || '', roll: j.roll || '', at: j.at || '' };
+        } catch (e) { return null; }
+      }))).filter(Boolean).sort((a, b) => String(a.at).localeCompare(String(b.at)));
+      return res.status(200).json({ items });
+    }
+
+    if (action === 'rsvpdel') {
+      const id = String((await readJson(req)).id || '');
+      if (!/^[a-z0-9-]{1,80}$/.test(id)) return res.status(400).json({ error: 'Bad id.' });
+      const { blobs } = await list({ prefix: 'site/rsvp/' + id + '.json', limit: 5 });
+      const hit = blobs.filter((x) => x.pathname === 'site/rsvp/' + id + '.json').map((x) => x.url);
+      if (hit.length) await del(hit);
+      return res.status(200).json({ ok: true });
+    }
+
     if (action === 'save') {
-      let body = {};
-      try { body = JSON.parse((await readBody(req)).toString('utf8')); } catch (e) {}
-      const data = clean(body);
+      const data = clean(await readJson(req));
       await put('site/data.json', JSON.stringify(data), {
         access: 'public', contentType: 'application/json',
         addRandomSuffix: false, allowOverwrite: true, cacheControlMaxAge: 60
       });
+      memo = { at: 0, data: null };
       return res.status(200).json({ ok: true, saved: data });
     }
 
@@ -104,6 +188,6 @@ export default async function handler(req, res) {
   } catch (e) {
     if (e && e.message === 'too_big') return res.status(413).json({ error: 'Image is too large. Use a smaller photo.' });
     console.error('api error', e);
-    return res.status(500).json({ error: 'Something went wrong. Check that a Blob store is connected in Vercel.' });
+    return res.status(500).json({ error: 'Something went wrong: ' + (e && e.message ? e.message : String(e)) });
   }
 }
