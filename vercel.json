@@ -1,5 +1,1 @@
-{
-  "rewrites": [
-    { "source": "/api/:a(login|data|save|upload)", "destination": "/api/site?a=:a" }
-  ]
-}
+{"rewrites":[{"source":"/api/:a(login|data|save|upload|rsvp|rsvps|rsvpdel)","destination":"/api/site?a=:a"}]}
